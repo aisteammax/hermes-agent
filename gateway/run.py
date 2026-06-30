@@ -18543,6 +18543,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             logging.getLogger().setLevel(_stderr_level)
 
     runner = GatewayRunner(config)
+
+    if replace:
+        try:
+            atomic_json_write(
+                _planned_restart_notification_path(),
+                {"requested_at": time.time(), "replace": True, "via_service": False},
+                indent=None,
+            )
+        except Exception as e:
+            logger.debug("Failed to write planned restart notification marker (--replace): %s", e)
     
     # Track whether an unexpected signal initiated the shutdown. When an
     # unexpected SIGTERM kills the gateway, we exit non-zero so service

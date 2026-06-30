@@ -1028,47 +1028,14 @@ class GatewayStreamConsumer:
         return "flood" in err_lower or "retry after" in err_lower or "rate" in err_lower
 
     def _resolve_draft_streaming(self) -> bool:
-        """Decide whether this run should use native draft streaming.
-
-        Honors ``cfg.transport``:
-          * ``"edit"``  → never use drafts (legacy progressive-edit path).
-          * ``"draft"`` → require draft support; gracefully fall back to edit
-            when the adapter declines.  Logs the downgrade at debug.
-          * ``"auto"``  → use drafts when the adapter supports them for this
-            chat type; otherwise edit.
-
-        Adapter eligibility is checked via
-        :meth:`BasePlatformAdapter.supports_draft_streaming`, which considers
-        the chat type (e.g. Telegram drafts are DM-only) and platform-version
-        gates (e.g. python-telegram-bot 22.6+).
+        """Draft streaming permanently disabled for this Hermes fork.
+        Draft frames (sendRichMessageDraft / sendMessageDraft) appear as
+        separate unformatted messages on Telegram clients that don't
+        animate the preview properly, causing "2-5 identical messages"
+        spam.  The edit-based path produces a single progressively-updated
+        message with full formatting throughout.
         """
-        transport = (self.cfg.transport or "edit").lower()
-        if transport == "edit":
-            return False
-        # "off" is filtered upstream by the gateway; treat as edit defensively.
-        if transport == "off":
-            return False
-        # Test adapters are MagicMocks that don't subclass BasePlatformAdapter;
-        # default them to edit so existing test behaviour is preserved.
-        if not isinstance(self.adapter, _BasePlatformAdapter):
-            return False
-        try:
-            supported = self.adapter.supports_draft_streaming(
-                chat_type=self.cfg.chat_type or None,
-                metadata=self.metadata,
-            )
-        except Exception:
-            logger.debug("supports_draft_streaming probe raised", exc_info=True)
-            supported = False
-        if not supported:
-            if transport == "draft":
-                logger.debug(
-                    "Draft streaming requested but unsupported (chat=%s, type=%r) — "
-                    "falling back to edit",
-                    self.chat_id, self.cfg.chat_type,
-                )
-            return False
-        return True
+        return False
 
     async def _send_draft_frame(self, text: str) -> bool:
         """Emit a single animated draft frame for the current accumulated text.
@@ -1644,6 +1611,22 @@ class GatewayStreamConsumer:
                         self._edit_supported = False
                     self._already_sent = True
                     self._last_sent_text = text
+                    if finalize and self._use_draft_streaming:
+                        # NOTE: (форк) Draft-streaming first-send path:
+                        # suppress got_done re-entry ONLY when the first send
+                        # actually SPLIT the message (multiple fragments).
+                        # When it fits in one message, let got_done proceed
+                        # so edit_message(finalize=True) can upgrade the
+                        # preview from legacy MarkdownV2 to a rich message
+                        # (tables, task lists, etc. render natively).
+                        _raw_resp = getattr(result, "raw_response", None) or {}
+                        _was_split = bool(
+                            isinstance(_raw_resp, dict)
+                            and len(_raw_resp.get("message_ids", ())) > 1
+                        )
+                        if _was_split:
+                            self._final_response_sent = True
+                            self._final_content_delivered = True
                     if not result.message_id:
                         self._fallback_prefix = self._visible_prefix()
                         self._fallback_final_send = True

@@ -1671,6 +1671,21 @@ def restart() -> None:
                 "start a duplicate. Investigate stray PIDs before retrying."
             )
 
+    # NOTE: (форк) На Windows старый gateway не создаёт .restart_pending.json
+    # т.к. stop() не получает restart-флаг. Создаём маркер здесь — в restart()
+    # между остановкой и стартом.
+    from gateway.run import _planned_restart_notification_path as _restart_pending_path
+    from utils import atomic_json_write as _ajw
+    import time as _time
+    try:
+        _ajw(
+            _restart_pending_path(),
+            {"requested_at": _time.time(), "replace": True, "via_service": False},
+            indent=None,
+        )
+    except Exception as e:
+        print(f"⚠ Failed to write restart notification marker: {e}")
+
     # Give Windows a moment to release the listening port.
     time.sleep(1.0)
     start()
