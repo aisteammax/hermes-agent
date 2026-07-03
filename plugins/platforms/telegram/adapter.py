@@ -4819,7 +4819,9 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as exc:  # pragma: no cover - missing SDK
             logger.warning("[%s] InputMediaPhoto unavailable, falling back to per-image send: %s", self.name, exc)
             return await super().send_multiple_images(chat_id, images, metadata, human_delay)
-        is_anim = lambda url: not url.startswith("file://") and self._is_animation_url(url)  # noqa: E731
+        # Local file:// GIFs count as animations too — they need send_animation, not the photo path.
+        is_anim = lambda url: (url.startswith("file://") and url.lower().endswith(".gif")) or \
+            (not url.startswith("file://") and self._is_animation_url(url))  # noqa: E731
         animations = [img for img in images if is_anim(img[0])]
         photos = [img for img in images if not is_anim(img[0])]
         delivered = False
