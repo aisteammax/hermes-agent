@@ -202,7 +202,8 @@ def local_batch_error(entries: List[Dict[str, Any]]) -> str:
     if len(args) > _ECHO_ARGS_MAX_CHARS:
         args = "{...}"  # keep the correction readable; the model still has its own arguments
     retry = '{"calls":[{"name":%s,"arguments":%s}]}' % (json.dumps(first["name"], ensure_ascii=False), args)
-    remaining = (f" then issue the remaining {len(entries) - 1} call(s) as separate tool_call invocations"
+    remaining = (f" then issue the remaining {len(entries) - 1} call(s) as separate tool_call "
+                 f"invocations in this same assistant message"
                  if len(entries) > 1 else "")
     return (
         f"tool_call takes exactly one entry for local tools; you sent {len(entries)}. "

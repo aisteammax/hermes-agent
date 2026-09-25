@@ -311,7 +311,9 @@ def bridge_tool_schemas(deferred_count: int, listing: Optional[str] = None,
             TOOL_CALL_NAME,
             "Invoke deferred tools. Takes `calls`, an array of {name, arguments} "
             "— one entry per invocation; a single call is an array of one. "
-            "Local tools require one entry per tool_call. Only connectors__ names "
+            "Local tools require one entry per tool_call: to run two local tools, emit two "
+            "tool_call calls in the same assistant message (both run in that turn) — never "
+            "two local entries in one `calls` array. Only connectors__ names "
             "may be batched together; mixed and multi-local batches are rejected. "
             "Connector entries execute individually with results in input order. "
             f"Argument shapes match each tool's schema (see `{TOOL_DESCRIBE_NAME}`). "
@@ -319,6 +321,17 @@ def bridge_tool_schemas(deferred_count: int, listing: Optional[str] = None,
             {
                 "calls": {
                     "type": "array",
+                    "minItems": 1,
+                    # Fork patch: advertise exactly what resolve_underlying_call accepts — ONE
+                    # local invocation, or one-or-more connector invocations. Without this a
+                    # two-local batch looks legal, is rejected wholesale at dispatch, and
+                    # costs a full round trip (upstream #119891; 10 hits here in 4 days).
+                    # Drop this patch when upstream accepts ordered local batches.
+                    "anyOf": [
+                        {"maxItems": 1},
+                        {"items": {"properties": {"name": {"pattern": "^connectors__"}},
+                                   "required": ["name"]}},
+                    ],
                     "items": {
                         "type": "object",
                         "properties": {
@@ -327,7 +340,7 @@ def bridge_tool_schemas(deferred_count: int, listing: Optional[str] = None,
                         },
                         "required": ["name", "arguments"],
                     },
-                    "description": "One local invocation, or one or more connector invocations. Never mix local and connector tools.",
+                    "description": "One local invocation, or one or more connector invocations. Never mix local and connector tools, and never two local tools in one array — emit a separate tool_call for each local tool (same assistant message).",
                 },
             },
             ["calls"],
