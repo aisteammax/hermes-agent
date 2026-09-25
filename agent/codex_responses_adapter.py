@@ -93,6 +93,18 @@ _IMAGE_PART_TYPES = {"image_url", "input_image"}
 _VIDEO_PART_TYPES = {"video", "video_url", "input_video"}
 _OUTPUT_TEXT_TYPES = {"output_text", "text"}
 _ASSISTANT_IMAGE_PLACEHOLDER = "[Assistant image omitted during replay]"
+_ASSISTANT_VIDEO_PLACEHOLDER = "[Assistant video omitted during replay]"
+# Responses backends that accept ``input_video`` parts. Verified live against the endpoint: a 2 s
+# animated clip came back described by its motion, not as a single frame. Families not listed here
+# keep the fail-closed contract, because a video request that silently degrades to text-only is
+# worse than a clear error — the model then answers about nothing and looks authoritative.
+_VIDEO_CAPABLE_MODEL_MARKERS = ("muse-spark",)
+
+
+def model_accepts_video_input(model: Optional[str]) -> bool:
+    """True when ``model`` is known to accept ``input_video`` parts on a Responses backend."""
+    name = (model or "").strip().lower()
+    return any(marker in name for marker in _VIDEO_CAPABLE_MODEL_MARKERS)
 # Inline data-URL subtypes the Responses backends accept as ``input_image``. Anything else
 # (SVG source, BMP, TIFF, ...) 400s the WHOLE request — and, once baked into history, every
 # later turn too — so it is downgraded to a text placeholder at this converging seam (#29711).
@@ -203,7 +215,7 @@ def _neutralize_harmony_structure(value: Any) -> Any:
 # --- Multimodal content helpers ---------------------------------------------
 
 def _iter_content_parts(content: list) -> Iterator[tuple[str, Any]]:
-    """Yield ``("text", str)`` / ``("image", part)`` for recognized chat parts."""
+    """Yield ``("text", str)`` / ``("image", part)`` / ``("video", part)`` for recognized chat parts."""
     for part in content:
         if isinstance(part, str) and part:
             yield "text", part
@@ -213,6 +225,8 @@ def _iter_content_parts(content: list) -> Iterator[tuple[str, Any]]:
                 yield "text", part["text"]
             elif ptype in _IMAGE_PART_TYPES:
                 yield "image", part
+            elif ptype in _VIDEO_PART_TYPES:
+                yield "video", part
 
 
 def _input_image_part(part: Dict[str, Any], role: str = "user", *, keep_empty_url: bool) -> Optional[Dict[str, Any]]:
@@ -246,13 +260,32 @@ def _input_image_part(part: Dict[str, Any], role: str = "user", *, keep_empty_ur
     return image_part
 
 
-def _chat_content_to_responses_parts(content: Any, *, role: str = "user") -> List[Dict[str, Any]]:
+def _input_video_part(part: Dict[str, Any], role: str = "user") -> Optional[Dict[str, Any]]:
+    """Responses video part from a chat/Responses video part. Assistant → text placeholder (an
+    assistant media part 400s the replay, same as images); user → ``input_video``, None for an
+    empty url. ``video_url`` may be a str, a ``{url, file_id}`` mapping, or the chat ``video`` key."""
+    if role == "assistant":
+        return {"type": "output_text", "text": _ASSISTANT_VIDEO_PLACEHOLDER}
+    url = part.get("video_url")
+    if url is None:
+        url = part.get("input_video") or part.get("video")
+    if isinstance(url, dict):
+        url = url.get("url") or url.get("file_id")
+    if not _nonempty_str(url):
+        return None
+    return {"type": "input_video", "video_url": str(url)}
+
+
+def _chat_content_to_responses_parts(content: Any, *, role: str = "user",
+                                     video_capable: bool = False) -> List[Dict[str, Any]]:
     """Chat-style multimodal content → Responses API input parts ([] if not a list). Text is
     ``input_text`` (user) / ``output_text`` (assistant) — the API rejects the wrong type per role;
-    ``input_image`` is only legal on user messages (see :func:`_input_image_part`). Unsupported
-    video parts fail closed instead of silently turning a video request into a text-only request."""
+    ``input_image`` is only legal on user messages (see :func:`_input_image_part`). Video converts
+    to ``input_video`` only for ``video_capable`` models; otherwise it still fails closed instead
+    of silently turning a video request into a text-only request."""
     for part in _as_list(content):
-        if isinstance(part, dict) and (ptype := _part_type(part)) in _VIDEO_PART_TYPES:
+        if (isinstance(part, dict) and not video_capable
+                and (ptype := _part_type(part)) in _VIDEO_PART_TYPES):
             raise ValueError(
                 f"Codex Responses does not support {ptype} input; use a video-capable provider."
             )
@@ -261,6 +294,9 @@ def _chat_content_to_responses_parts(content: Any, *, role: str = "user") -> Lis
     for kind, payload in _iter_content_parts(_as_list(content)):
         if kind == "text":
             converted.append({"type": text_type, "text": payload})
+        elif kind == "video":
+            if (video_part := _input_video_part(payload, role)) is not None:
+                converted.append(video_part)
         elif (part := _input_image_part(payload, role, keep_empty_url=False)) is not None:
             converted.append(part)
     return converted
@@ -276,8 +312,14 @@ def _summarize_user_message_for_log(content: Any, *, sep: str = " ") -> str:
             return ""
     parts = list(_iter_content_parts(content))
     text_bits = [payload for kind, payload in parts if kind == "text"]
-    image_count = len(parts) - len(text_bits)
-    note = f"[{image_count} image{'s' if image_count != 1 else ''}]" if image_count else ""
+    image_count = sum(1 for kind, _ in parts if kind == "image")
+    video_count = sum(1 for kind, _ in parts if kind == "video")
+    markers = []
+    if image_count:
+        markers.append(f"{image_count} image{'s' if image_count != 1 else ''}")
+    if video_count:
+        markers.append(f"{video_count} video{'s' if video_count != 1 else ''}")
+    note = f"[{', '.join(markers)}]" if markers else ""
     return " ".join(bit for bit in (note, sep.join(text_bits).strip()) if bit)
 
 
@@ -540,6 +582,7 @@ def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]], *, is_xai_responses: bool = False, is_github_responses: bool = False,
     replay_encrypted_reasoning: bool = True, current_issuer_kind: Optional[str] = None,
     current_issuer_model: Optional[str] = None, native_compaction_eligible: bool = False,
+    video_capable: bool = False,
 ) -> List[Dict[str, Any]]:
     """Convert internal chat-style messages to Responses input items.
 
@@ -605,7 +648,9 @@ def _chat_messages_to_responses_input(
         if role not in {"user", "assistant"}:
             continue
         content = msg.get("content", "")
-        content_parts = _chat_content_to_responses_parts(content, role=role)  # [] unless a list
+        content_parts = _chat_content_to_responses_parts(
+            content, role=role, video_capable=video_capable,
+        )  # [] unless a list
         text_type = _text_type_for(role)
         content_text = (
             "".join(p["text"] for p in content_parts if p["type"] == text_type)
@@ -707,6 +752,7 @@ def _native_responses_replay_items(
             current_issuer_kind=_classify_responses_issuer(base_url=getattr(agent, "base_url", None), **route),
             current_issuer_model=_wire_model_identity(effective_model),
             native_compaction_eligible=True,
+            video_capable=model_accepts_video_input(_wire_model_identity(effective_model)),
         )
     except Exception:
         logger.debug(
