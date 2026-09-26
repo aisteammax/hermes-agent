@@ -3,7 +3,11 @@ import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router'
 
 import { NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
-import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
+import {
+  extendRefreshPageToOverlap,
+  graftRefreshedTailOntoBackfill,
+  olderPageReader
+} from '@/app/chat/transcript-backfill'
 import { defaultNewSessionTarget, prepareDefaultNewSession } from '@/app/session/new-session-route'
 import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
@@ -55,13 +59,15 @@ import {
   normalizeProfileKey,
   resolveNewChatOwnerRoute
 } from '@/store/profile'
-import { $projectScope, resolveNewSessionCwd } from '@/store/projects'
+import { $projectScope } from '@/store/project-scope'
+import { resolveNewSessionCwd } from '@/store/projects'
 import { receiveApprovalRequest, replayPendingApproval } from '@/store/prompts'
 import { clearStoredTranscriptReadOnly, markStoredTranscriptReadOnly } from '@/store/read-only-transcript'
 import {
   $activeSessionStoredIdRotation,
   $connection,
   $currentCwd,
+  $currentCwdExplicit,
   $currentFastMode,
   $currentModel,
   $currentProvider,
@@ -81,6 +87,7 @@ import {
   setBusy,
   setCurrentBranch,
   setCurrentCwd,
+  setCurrentCwdExplicit,
   setCurrentCwdTransient,
   setCurrentServiceTier,
   setCurrentUsage,
@@ -133,7 +140,13 @@ import { $archivedSessions } from '@/store/sidebar-archive'
 import { restoreSessionTodosFromSnapshot } from '@/store/todos'
 import { dropTranscriptTail, dropTranscriptTailEverywhere, saveTranscriptTail } from '@/store/transcript-tail-cache'
 import { isWatchWindow } from '@/store/windows'
-import type { SessionCreateResponse, SessionMessage, SessionResumeResult, UsageStats } from '@/types/hermes'
+import type {
+  SessionCreateResponse,
+  SessionMessage,
+  SessionMessagesResponse,
+  SessionResumeResult,
+  UsageStats
+} from '@/types/hermes'
 
 import { navigateToWorkspacePage, NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
@@ -347,6 +360,9 @@ async function desktopSessionCreateParams(
     cols: 96,
     source: 'desktop',
     ...(cwd && { cwd }),
+    // #52589: explicit provenance for the shipped cwd — an inherited app-global
+    // workspace must not override the target profile's configured terminal.cwd.
+    ...(cwd && { cwd_explicit: $currentCwdExplicit.get() }),
     ...(profile ? { profile: capturedRoute?.targetProfile || profile } : {}),
     ...(includeComposerSelection
       ? {
@@ -364,6 +380,39 @@ interface FreshSessionDraftOptions {
   preserveRoute?: boolean
   replaceRoute?: boolean
   workspaceTarget?: NewChatWorkspaceTarget
+}
+
+/** Drop the pre-hydration request-id row without copying the other messages.
+ *  A copied clarify row looks like a concurrent edit and hydration keeps both. */
+function withoutEarlyClarifyProjection(messages: ChatMessage[], requestId: string): ChatMessage[] {
+  let changed = false
+  const next: ChatMessage[] = []
+
+  for (const message of messages) {
+    const parts = message.parts.filter(
+      part =>
+        !(
+          part.type === 'tool-call' &&
+          part.toolName === 'clarify' &&
+          part.result === undefined &&
+          part.toolCallId === requestId
+        )
+    )
+
+    if (parts.length === message.parts.length) {
+      next.push(message)
+
+      continue
+    }
+
+    changed = true
+
+    if (parts.length > 0) {
+      next.push({ ...message, parts })
+    }
+  }
+
+  return changed ? next : messages
 }
 
 /** Session-state patch for a restored blocking prompt row; the first non-null projection is used. */
@@ -552,6 +601,10 @@ export function useSessionActions({
       setCurrentServiceTier('')
       setYoloActive(false)
       setNewChatWorkspaceTarget(hasWorkspaceTarget ? workspaceTarget : undefined)
+      // #52589 provenance: only a deliberate string workspace target is an explicit
+      // cwd choice. A plain new chat (or a detached `null`) is not — its inherited
+      // launch/project workspace must yield to a named profile's configured cwd.
+      setCurrentCwdExplicit(typeof workspaceTarget === 'string')
 
       if (!hasWorkspaceTarget) {
         // In a project → the repo's default-branch checkout; not in a project →
@@ -744,13 +797,16 @@ export function useSessionActions({
         setNewChatWorkspaceTarget(undefined)
         setActiveSessionId(created.session_id)
         setSelectedStoredSessionId(stored)
-        setSessionStartedAt(Date.now())
+        const runtimeStartedAt = Date.now()
+        setSessionStartedAt(runtimeStartedAt)
         const yoloArmed = $yoloActive.get()
         const runtimeInfo = applyRuntimeInfo(created.info)
 
-        if (runtimeInfo) {
-          updateSessionState(created.session_id, state => ({ ...state, ...runtimeInfo }), stored)
-        }
+        updateSessionState(
+          created.session_id,
+          state => ({ ...state, ...(runtimeInfo ?? {}), runtimeStartedAt }),
+          stored
+        )
 
         // User may have armed YOLO on the new-chat draft before the runtime
         // session existed — apply it to the freshly created session.
@@ -867,6 +923,10 @@ export function useSessionActions({
 
         const cwd =
           options?.cwd === null ? '' : typeof options?.cwd === 'string' ? options.cwd.trim() : resolveNewSessionCwd()
+
+        // #52589 provenance for the tile path: an explicitly-passed cwd is a
+        // deliberate workspace pick; a resolved default is inherited.
+        setCurrentCwdExplicit(typeof options?.cwd === 'string')
 
         // Bot-workspace tabs target an agent profile without switching the
         // window's ambient composer. Do not leak that unrelated session's
@@ -1305,7 +1365,7 @@ export function useSessionActions({
           // un-owned for the life of the session (#71254).
           setWorkspaceCwdOwner(storedSessionId)
           setCurrentBranch(cachedViewState.branch)
-          setSessionStartedAt(Date.now())
+          setSessionStartedAt(cachedViewState.runtimeStartedAt)
 
           try {
             const replay = pendingSessionReplay(cachedRuntimeId)
@@ -1437,6 +1497,25 @@ export function useSessionActions({
               // Once the attached transport reports a later terminal event,
               // that live state is authoritative and must not be overwritten
               // by the older `running` value after the REST request resolves.
+              // The activate snapshot is enough to answer a still-pending clarify.
+              // Publish that row in the same view update as needsInput, before
+              // transcript REST. An armed hold still hides unproven history, so
+              // the question rides a new row the hold cannot swallow by grafting
+              // it onto a cutoff assistant. Hydration strips that synthetic id
+              // and re-derives one authoritative row.
+              const clarifyPayload = pendingClarify ? pendingClarifyToolPayload(pendingClarify) : null
+
+              const earlyClarifyProjection = clarifyPayload
+                ? restorePendingClarifyToolCall(suppressUnprovenWarmTranscript ? [] : activatedMessages, clarifyPayload)
+                : null
+
+              const projectedTail = earlyClarifyProjection?.messages.at(-1)
+
+              const earlyClarifyMessages =
+                earlyClarifyProjection && suppressUnprovenWarmTranscript && projectedTail
+                  ? [...activatedMessages, projectedTail]
+                  : earlyClarifyProjection?.messages
+
               const activatedLivenessState = updateSessionState(
                 cachedRuntimeId,
                 state => ({
@@ -1456,7 +1535,13 @@ export function useSessionActions({
                   // without ever having received its prompt, so the settle
                   // path must not take the "I saw it all" shortcut.
                   adoptedRunningTurn: state.adoptedRunningTurn || running,
-                  turnStartedAt: running ? (activatedTurnStartedAt ?? state.turnStartedAt ?? Date.now()) : null
+                  turnStartedAt: running ? (activatedTurnStartedAt ?? state.turnStartedAt ?? Date.now()) : null,
+                  ...(earlyClarifyProjection
+                    ? {
+                        messages: earlyClarifyMessages ?? state.messages,
+                        ...livePromptStreamId(null, earlyClarifyProjection)
+                      }
+                    : {})
                 }),
                 storedSessionId
               )
@@ -1535,10 +1620,22 @@ export function useSessionActions({
                   // The REST hydration is a newest-tail page; graft it onto any
                   // older pages the previous view already backfilled so
                   // re-activating a scrolled-back session keeps its history.
-                  const persistedMessages = graftRefreshedTailOntoBackfill(
+                  // A long turn can push every rendered row off the newest page;
+                  // read older pages until they overlap so the graft keeps history.
+                  const persistedTail = await extendRefreshPageToOverlap(
                     toChatMessages(persisted.messages),
-                    cachedViewState.messages
+                    cachedViewState.messages,
+                    olderPageReader(storedSessionId, sessionRestScope, persisted)
                   )
+
+                  // The extra page reads await; re-check ownership like the read above.
+                  if (!hydration.owns()) {
+                    hydration.release()
+
+                    return
+                  }
+
+                  const persistedMessages = graftRefreshedTailOntoBackfill(persistedTail, cachedViewState.messages)
 
                   const runtimeMessages = toChatMessages(activated.messages)
                   const previousMessages = removeRepresentedLocalLiveProjection(cachedViewState.messages, activated)
@@ -1549,9 +1646,16 @@ export function useSessionActions({
                     activated
                   )
 
+                  const latestCachedMessages = sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)?.messages
+
+                  const cachedWithoutEarlyClarify =
+                    latestCachedMessages && pendingClarify
+                      ? withoutEarlyClarifyProjection(latestCachedMessages, pendingClarify.requestId)
+                      : latestCachedMessages
+
                   const currentLiveTurn = reconcilePersistedLiveTurn(
                     persistedMessages,
-                    sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)?.messages ?? previousMessages,
+                    cachedWithoutEarlyClarify ?? previousMessages,
                     persisted.messages,
                     liveProjection
                   )
@@ -1567,13 +1671,21 @@ export function useSessionActions({
 
               const currentMessages = sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)?.messages
 
+              // The early publish may have appended a synthetic request-id row so
+              // the hold could not hide the question. Drop it before overlaying
+              // concurrent edits; the projection below re-derives one row.
+              const currentForOverlay =
+                currentMessages && pendingClarify
+                  ? withoutEarlyClarifyProjection(currentMessages, pendingClarify.requestId)
+                  : currentMessages
+
               // The occurrence-aware path already read the latest cache. An
               // additional identity overlay would restore its consumed tools.
-              if (currentMessages && !reconciledCurrentLiveTurn) {
+              if (currentForOverlay && !reconciledCurrentLiveTurn) {
                 activatedMessages = overlayConcurrentMessageChanges(
                   activatedMessages,
                   cachedViewState.messages,
-                  currentMessages
+                  currentForOverlay
                 )
               }
 
@@ -1722,7 +1834,8 @@ export function useSessionActions({
       clearNotifications()
       setSelectedStoredSessionId(storedSessionId)
       selectedStoredSessionIdRef.current = storedSessionId
-      setSessionStartedAt(Date.now())
+      const runtimeStartedAt = Date.now()
+      setSessionStartedAt(runtimeStartedAt)
 
       const stored =
         $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ?? storedForProfile
@@ -1796,7 +1909,7 @@ export function useSessionActions({
         // keeps it from surfacing as unhandled while the prefetch settles.
         resumePromise.catch(() => undefined)
 
-        let prefetchedResult: { messages: SessionMessage[]; session_id?: string } | null = null
+        let prefetchedResult: SessionMessagesResponse | null = null
 
         try {
           if (prefetchPromise) {
@@ -1840,17 +1953,23 @@ export function useSessionActions({
             : viewMessagesForReconcile()
 
           // Tail page + previously backfilled prefix (same-session re-resume).
-          const graftedPrefetch = graftRefreshedTailOntoBackfill(
+          // A long turn can push every rendered row off the newest page; read
+          // older pages until they overlap so the graft keeps earlier history.
+          const prefetchedTail = await extendRefreshPageToOverlap(
             toChatMessages(prefetchedResult.messages),
-            previousMessages
+            previousMessages,
+            olderPageReader(storedSessionId, sessionRestScope, prefetchedResult)
           )
+
+          const graftedPrefetch = graftRefreshedTailOntoBackfill(prefetchedTail, previousMessages)
 
           prefetchedTranscriptMessages = graftedPrefetch
           localSnapshot = reconcileAuthoritativeChatMessages(graftedPrefetch, previousMessages)
           prefetchApplied = true
           prefetchedStoredSessionId = prefetchedResult.session_id || storedSessionId
 
-          if (!chatMessageArraysEquivalent($messages.get(), localSnapshot)) {
+          // The overlap reads await; skip painting if this resume went stale.
+          if (isCurrentResume() && !chatMessageArraysEquivalent($messages.get(), localSnapshot)) {
             setMessages(localSnapshot)
           }
         }
@@ -2057,6 +2176,7 @@ export function useSessionActions({
           state => ({
             // The deferred build reports the session's own effort later (#79807).
             ...markReasoningEffortPending({ ...state, ...(runtimeInfo ?? {}) }),
+            runtimeStartedAt,
             messages: visibleMessagesForView,
             transcriptProvenance,
             busy: resumedRunning,
@@ -2360,20 +2480,54 @@ export function useSessionActions({
 
         // No title: the backend auto-names the branch from its parent's lineage.
         if (!createFlight) {
+          const branchParams = {
+            session_id: sourceSessionId,
+            ...(branchCount !== undefined ? { count: branchCount } : {})
+          }
+
+          const createParams = {
+            cols: 96,
+            source: 'desktop',
+            ...(cwd && { cwd }),
+            ...(profile ? { profile } : {}),
+            ...(parentStoredId && { parent_session_id: parentStoredId })
+          }
+
           createFlight = (
             sourceSessionId
-              ? requestBranchGateway<SessionCreateResponse>('session.branch', {
-                  session_id: sourceSessionId,
-                  ...(branchCount !== undefined ? { count: branchCount } : {})
+              ? requestBranchGateway<SessionCreateResponse>(
+                  branchCount === undefined ? 'session.branch_whole' : 'session.branch',
+                  branchParams
+                ).catch(err => {
+                  if (!isMissingRpcMethod(err)) {
+                    throw err
+                  }
+
+                  return requestBranchGateway<SessionCreateResponse>('session.branch', branchParams)
                 })
-              : requestBranchGateway<SessionCreateResponse>('session.create', {
-                  cols: 96,
-                  source: 'desktop',
-                  ...(cwd && { cwd }),
-                  ...(profile ? { profile } : {}),
-                  messages: branchMessages.map(({ content, role }) => ({ content, role })),
-                  ...(parentStoredId && { parent_session_id: parentStoredId })
-                })
+              : branchMessages.length
+                ? requestBranchGateway<SessionCreateResponse>('session.create', {
+                    ...createParams,
+                    messages: branchMessages.map(({ content, role }) => ({ content, role }))
+                  })
+                : requestBranchGateway<SessionCreateResponse>('session.branch_stored', createParams).catch(
+                    async err => {
+                      if (!isMissingRpcMethod(err)) {
+                        throw err
+                      }
+
+                      const { messages } = await getAllSessionMessages(parentStoredId ?? '', ownerRoute ?? profile)
+
+                      if (!messages.length) {
+                        throw new Error('nothing to branch — send a message first')
+                      }
+
+                      return requestBranchGateway<SessionCreateResponse>('session.create', {
+                        ...createParams,
+                        messages: messages.map(({ content, role }) => ({ content, role }))
+                      })
+                    }
+                  )
           ).catch(err => {
             // Drop the flight so a genuine retry re-issues the create; a
             // resolved flight is cleared once the child is fully published.
@@ -2390,6 +2544,7 @@ export function useSessionActions({
 
         const effectiveBranchMessages = responseBranchMessages.length ? responseBranchMessages : branchMessages
         const routedSessionId = branched.stored_session_id ?? branched.session_id
+        const runtimeStartedAt = Date.now()
         const preview = effectiveBranchMessages.map(({ content }) => content).find(Boolean) ?? null
 
         // Record the exact owner and pin its socket THE MOMENT the create
@@ -2437,6 +2592,7 @@ export function useSessionActions({
           branched.session_id,
           state => ({
             ...state,
+            runtimeStartedAt,
             messages: effectiveBranchMessages.map(({ source }) => source),
             busy: false,
             awaitingResponse: false
@@ -2523,11 +2679,10 @@ export function useSessionActions({
       const startingRouteToken = getRouteToken()
       const startingCwd = $currentCwd.get().trim()
 
-      // The live atom may be a compacted model projection. Read the durable
-      // display projection before choosing the branch prefix so a whole-chat
-      // branch does not inherit only the summary/tail. If the backend is
-      // temporarily unavailable, retain the local snapshot and let the branch
-      // RPC make its own authoritative read.
+      // Message-level branches still need the local message id to choose their
+      // prefix. Whole-chat branches send only the parent identity below; the
+      // backend reads the durable display projection without materializing it in
+      // the renderer.
       let authoritativeMessages: ChatMessage[] | null = null
       const profile = await resolveSessionProfile(storedSessionId)
 
@@ -2537,7 +2692,7 @@ export function useSessionActions({
       // whichever socket is active.
       const ownerRoute = storedSessionId ? sessionOwnerRouteFromRow(cachedSessionRow(storedSessionId)) : undefined
 
-      if (storedSessionId) {
+      if (messageId && storedSessionId) {
         try {
           const persisted = await getAllSessionMessages(storedSessionId, ownerRoute ?? profile)
           const hydrated = toChatMessages(persisted.messages)
@@ -2568,9 +2723,9 @@ export function useSessionActions({
         return false
       }
 
-      const branchMessages = selectBranchMessages(messages, authoritativeMessages, messageId)
+      const branchMessages = messageId ? selectBranchMessages(messages, authoritativeMessages, messageId) : []
 
-      if (!branchMessages.length) {
+      if (messageId && !branchMessages.length) {
         notify({ kind: 'warning', title: copy.nothingToBranch, message: copy.branchNoText })
 
         return false
@@ -2623,21 +2778,10 @@ export function useSessionActions({
           await ensureGatewayProfile(profile)
         }
 
-        // Read the parent transcript from the backend that OWNS it. A bare
-        // profile scope resolves against the active connection, which for a
-        // foreign-owned parent holds no such session: the read comes back empty
-        // and the branch aborts as "nothing to branch" before any create.
-        const { messages } = await getAllSessionMessages(storedSessionId, ownerRoute ?? profile)
-        const branchMessages = toBranchMessages(toChatMessages(messages))
-
-        if (!branchMessages.length) {
-          notify({ kind: 'warning', title: copy.nothingToBranch, message: copy.branchNoText })
-
-          return false
-        }
-
+        // Ask the owning backend to read and copy the parent transcript. The
+        // renderer deliberately does not materialize the complete history.
         return await forkBranch(
-          branchMessages,
+          [],
           null,
           stored?.id ?? storedSessionId,
           stored?.cwd?.trim(),
@@ -2880,6 +3024,44 @@ export function useSessionActions({
     ]
   )
 
+  // The Archived view reuses the sidebar row menu; its already-archived rows
+  // dispatch here through the same archive verb (#98813). Mirrors the Settings
+  // → Archived Chats restore (sessions-settings.tsx): flip the persisted flag
+  // back off, drop the archived-view row, and resurface the session in the
+  // sidebar without waiting for a full refresh.
+  const unarchiveSession = useCallback(
+    async (storedSessionId: string) => {
+      clearNotifications()
+
+      const archived = $archivedSessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+      const profile = archived?.profile?.trim() || undefined
+
+      try {
+        await setSessionArchived(storedSessionId, false, profile)
+
+        // Drop the archived-view row first so the view reflects the restore
+        // even when the session cannot be re-listed below (e.g. it belongs to
+        // a profile the current query does not cover).
+        $archivedSessions.set(
+          $archivedSessions.get().filter(session => !sessionMatchesStoredId(session, storedSessionId))
+        )
+
+        if (archived) {
+          // Lift any optimistic eviction so the grouped tree shows it again,
+          // and re-list through the slice router so a messaging/cron row lands
+          // back in its own list, not the sessions one.
+          untombstoneSessions([storedSessionId, archived._lineage_root_id])
+          restoreListedSession({ ...archived, archived: false })
+        }
+
+        notify({ durationMs: 2_000, kind: 'success', message: copy.restored })
+      } catch (err) {
+        notifyError(err, copy.unarchiveFailed)
+      }
+    },
+    [copy]
+  )
+
   return {
     archiveSession,
     branchCurrentSession,
@@ -2891,6 +3073,7 @@ export function useSessionActions({
     removeSession,
     resumeSession,
     selectSidebarItem,
-    startFreshSessionDraft
+    startFreshSessionDraft,
+    unarchiveSession
   }
 }

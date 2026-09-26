@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { group, split } from '@/components/pane-shell/tree/model'
 import { $layoutTree, noteActiveTreeGroup } from '@/components/pane-shell/tree/store'
@@ -10,13 +10,16 @@ import { registry } from '@/contrib/registry'
 import { $connectionsRegistry } from '@/store/connection-registry-state'
 import { $sidebarMessagingOpenIds, setSidebarAgentsGrouped, setSidebarGrouping } from '@/store/layout'
 import { $activeGatewayProfile, $profiles, setShowAllProfiles } from '@/store/profile'
-import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
+import { $projectScope, ALL_PROJECTS } from '@/store/project-scope'
+import { $projectTree } from '@/store/projects'
 import {
   $currentCwd,
   $messagingSessions,
   $messagingTruncated,
   $selectedStoredSessionId,
   $sessions,
+  $sessionsLoadError,
+  $sessionsLoading,
   $workspaceCwdOwner
 } from '@/store/session'
 import { $removedSessionIds } from '@/store/session-removal'
@@ -38,7 +41,7 @@ const sessionRows = [
   makeSessionInfo({ id: 'tile-two', last_active: 2, profile: 'default', started_at: 1, title: 'Tile two' })
 ]
 
-const renderSidebar = (pathname: string, currentView: AppView) =>
+const renderSidebar = (pathname: string, currentView: AppView, onRetrySessions: () => Promise<void> = noopAsync) =>
   render(
     <MemoryRouter initialEntries={[pathname]}>
       <SidebarProvider>
@@ -53,6 +56,7 @@ const renderSidebar = (pathname: string, currentView: AppView) =>
           onNewSessionInWorkspace={noop}
           onNewSessionSplit={noop}
           onResumeSession={noop}
+          onRetrySessions={onRetrySessions}
           onTriggerCronJob={noopAsync}
         />
       </SidebarProvider>
@@ -196,6 +200,31 @@ describe('ChatSidebar navigation activity', () => {
   })
 })
 
+// #67600: a cold-start read that failed used to render as an empty account.
+describe('ChatSidebar cold-start load failure', () => {
+  afterEach(() => {
+    cleanup()
+    $sessions.set([])
+    $sessionsLoading.set(true)
+    $sessionsLoadError.set(false)
+  })
+
+  it('offers retry in place of the empty state', () => {
+    const retry = vi.fn(noopAsync)
+    $sessions.set([])
+    $sessionsLoading.set(false)
+    $sessionsLoadError.set(true)
+
+    renderSidebar('/', 'chat', retry)
+
+    expect(screen.getByText('Could not load sessions')).toBeTruthy()
+    expect(screen.queryByText('No sessions yet')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(retry).toHaveBeenCalledTimes(1)
+  })
+})
+
 // Entering a project is a scope switch: the conversation main is showing keeps
 // its workspace, so Files/Review and the composer's Git context can't drift to
 // the project while the transcript stays on the old chat (#72772).
@@ -249,6 +278,73 @@ describe('ChatSidebar project entry', () => {
 // Messaging platforms group rows by owner the same way recents does once every
 // profile is on screen, so a Telegram thread is attributable to its profile
 // (#87715). The platform's row cap and load-more stay the section's.
+describe('ChatSidebar section labels', () => {
+  const realProject = {
+    id: '/repos/new-project',
+    label: 'new-project',
+    path: '/repos/new-project',
+    repos: [],
+    sessionCount: 0
+  }
+
+  // The synthetic Home bucket the backend emits when no project claimed a
+  // session (no cwd / deleted workspace): one lane, no repo structure.
+  const homeOnly = [
+    {
+      ...realProject,
+      id: '__no_project__',
+      label: 'Home',
+      path: null,
+      isNoProject: true,
+      sessionCount: 2
+    }
+  ]
+
+  afterEach(() => {
+    cleanup()
+    $projectScope.set(ALL_PROJECTS)
+    $projectTree.set([])
+    setSidebarAgentsGrouped(false)
+    $sessions.set([])
+  })
+
+  it('labels the section "Projects" when the grouped tree has a real project', () => {
+    setSidebarAgentsGrouped(true)
+    $projectTree.set([realProject])
+
+    renderSidebar('/', 'chat')
+
+    expect(screen.getByText('Projects')).toBeTruthy()
+    expect(screen.queryByText('Sessions')).toBeNull()
+  })
+
+  it('keeps the "Sessions" label when grouping is on but no projects exist', () => {
+    // The source-filter toggle with an empty tree: the section lists plain
+    // chat sessions, so heading it "Projects" mislabeled them (#62537).
+    setSidebarAgentsGrouped(true)
+    $projectTree.set([])
+    $sessions.set(sessionRows)
+
+    renderSidebar('/', 'chat')
+
+    expect(screen.getByText('Sessions')).toBeTruthy()
+    expect(screen.queryByText('Projects')).toBeNull()
+  })
+
+  it('keeps the "Sessions" label when the grouped tree is only the synthetic Home bucket', () => {
+    // No real projects — every session fell into Home. A lone Home bucket is
+    // the flat session list wearing a project costume, not a switcher.
+    setSidebarAgentsGrouped(true)
+    $projectTree.set(homeOnly)
+    $sessions.set(sessionRows)
+
+    renderSidebar('/', 'chat')
+
+    expect(screen.getByText('Sessions')).toBeTruthy()
+    expect(screen.queryByText('Projects')).toBeNull()
+  })
+})
+
 describe('ChatSidebar messaging owners', () => {
   const telegram = (id: string, profile: string, last_active: number) =>
     makeSessionInfo({ connection_id: 'local', id, last_active, profile, source: 'telegram', title: id })

@@ -106,6 +106,7 @@ import {
 import { runGatewayRestart } from '@/store/system-actions'
 import type { PaginatedSessions, UsageStats } from '@/types/hermes'
 
+import { pluginDecisions, profiles, skills, toolsets } from './bridge'
 import { composerHost } from './composer'
 import { planPluginOpenSession } from './plugin-open-session-plan'
 import { sessionsHost } from './sessions'
@@ -922,6 +923,13 @@ export const host = {
   /** Session-list mutations (pin, reorder, colour) — see `./sessions`. */
   sessions: sessionsHost,
 
+  /** Typed capabilities bridge — see `./bridge.ts`. `pluginDecisions` is
+   *  read-only: plugin toggling stays in the app's Plugins tab. */
+  skills,
+  toolsets,
+  profiles,
+  pluginDecisions,
+
   /** Open a stored session the way core surfaces do. A plugin/Bot Mode open
    *  is navigation, not a workspace or chrome API-home switch —
    *  keepAllProfilesScope defaults true so `$activeGatewayProfile` /
@@ -952,12 +960,16 @@ export const host = {
     // path below still keys off the explicit cross-connection route, so a plain
     // local open dials exactly as before (openGatewayForProfile), never the
     // registry-secondary path.
-    const localConnectionId = activeGatewayConnectionId()
+    const liveConnection = $connection.get()
+    const liveRemote = liveConnection?.mode === 'remote'
+    const liveConnectionId = String(liveConnection?.connectionId ?? '').trim()
+    const ambientConnectionId = (liveRemote && liveConnectionId) || activeGatewayConnectionId()
+    const ambientMode = liveRemote ? ('remote' as const) : ('local' as const)
 
     const ownerRoute =
       explicitRoute ??
-      (options.workspaceMode === 'bots' && profile && localConnectionId
-        ? { connectionId: localConnectionId, mode: 'local' as const, profile: targetProfile }
+      (options.workspaceMode === 'bots' && profile && ambientConnectionId
+        ? { connectionId: ambientConnectionId, mode: ambientMode, profile: targetProfile }
         : null)
 
     const expectHistory = options.expectHistory ?? false
@@ -996,16 +1008,18 @@ export const host = {
     if (ownerRoute) {
       setSessionOwnerHint(storedSessionId, ownerRoute)
     } else if (profile) {
-      // Local plugin-owned opens (Bot Mode without a cross-connection route)
-      // still carry an explicit owning profile. Record it: hidden sessions
-      // (canonical Bot Chats) have no sidebar row, so this hint is the only
-      // durable owner record the session-RPC router can consult — without it
-      // a later prompt.submit resolves to the ACTIVE profile's backend and
-      // 4001s while the bot's own backend is healthy.
-      const connectionId = activeGatewayConnectionId()
-
-      if (connectionId) {
-        setSessionOwnerHint(storedSessionId, { connectionId, mode: 'local', profile: targetProfile })
+      // Plugin-owned opens without a cross-connection route still carry an
+      // explicit owning profile. Record it: hidden sessions have no sidebar
+      // row, so this hint is the only durable owner record the session-RPC
+      // router can consult. Do not stamp mode local when the live connection
+      // is remote — that hint persists and the next open resolves the profile
+      // against this machine (#90477).
+      if (ambientConnectionId) {
+        setSessionOwnerHint(storedSessionId, {
+          connectionId: ambientConnectionId,
+          mode: ambientMode,
+          profile: targetProfile
+        })
       }
     }
 
@@ -1598,7 +1612,9 @@ export {
   type ComposerAtCompletionItem,
   type ComposerAtCompletionSource,
   type ComposerAttachmentProvider,
-  type ComposerMiddleware
+  type ComposerMiddleware,
+  type ComposerModelPillContext,
+  type ComposerModelPillProvider
 } from '@/app/chat/composer/contrib'
 /** THE session status dot — the one primitive the sidebar row, the pane tabs
  *  and the session switcher render, so a session's status can never disagree
@@ -1660,6 +1676,12 @@ export {
   type SidebarNavContribution,
   WORKSPACE_PAGE_HEADER_AREA
 } from '@/app/routes'
+/** Appearance settings' plugin seam: register a render contribution at
+ *  `APPEARANCE_AREAS.extra` to add controls at the end of the Appearance page.
+ *  `ColorSwatches` is the app's own swatch grid (profile rail / project dialog
+ *  look) — use it for colour picking instead of driving app widgets through
+ *  React internals; pair it with `host.sessions.setColor` for session colours. */
+export { APPEARANCE_AREAS } from '@/app/settings/appearance-contrib'
 
 /** THE settings rows: `ListRow` is label + description with the control beside
  *  it (wide) or under it (narrow); `ToggleRow` is the one on/off row — a Switch,
@@ -1759,6 +1781,10 @@ export { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
  *  layout classes — it just bakes in `type="button"` and a stable `data-slot`.
  *  Use it for rows and regions; `Button` is for ordinary compact actions. */
 export { RowButton } from '@/components/ui/row-button'
+/** The sanctioned embed primitive for external web content: a sandboxed
+ *  iframe (opaque origin, `allow-scripts` by default) — never a raw
+ *  `<webview>`, which would land on the app's own preview partition. */
+export { SandboxedFrame, type SandboxedFrameProps } from '@/components/ui/sandboxed-frame'
 export { ScrollArea } from '@/components/ui/scroll-area'
 export { SearchField } from '@/components/ui/search-field'
 export { SegmentedControl } from '@/components/ui/segmented-control'
@@ -1850,6 +1876,8 @@ export { formatModifierToken } from '@/lib/keybinds/combo'
  *  a renderer that stays open for days. Only for values that can be
  *  regenerated — eviction costs a recompute or a refetch, never correctness. */
 export { LruCache } from '@/lib/lru-cache'
+/** Capture a gateway file download alongside a REST read (see the SDK guide). */
+export { captureGatewayFileDownload } from '@/lib/media'
 /** The app's deterministic identity color for a name (profiles, assignees,
  *  authors), its translucent tag fill, and the curated picker swatches — so
  *  plugin-rendered identities read the same hue as everywhere else. The
