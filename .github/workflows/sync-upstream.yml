@@ -1,0 +1,63 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # 21:00 UTC = 04:00 AM ICT (UTC+7)
+    - cron: '0 21 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout local branch
+        uses: actions/checkout@v4
+        with:
+          ref: local
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add and fetch upstream
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main
+          # Keep main branch in fork synchronized as well
+          git push origin upstream/main:main || true
+
+      - name: Merge upstream into local
+        id: merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git merge --no-edit upstream/main; then
+            echo "Clean merge, pushing to local..."
+            git push origin local
+          else
+            echo "Merge conflict detected!"
+            CONFLICTS=$(git diff --name-only --diff-filter=U)
+            echo "Conflicting files:"
+            echo "$CONFLICTS"
+            git merge --abort
+
+            DATE=$(date +%Y%m%d-%H%M)
+            BRANCH="sync-upstream-$DATE"
+            git checkout -b "$BRANCH" upstream/main
+            git push origin "$BRANCH"
+
+            PR_BODY="### 🚨 Auto-sync conflict detected"$'\n\n'"Upstream changes conflict with our local patches."$'\n\n'"**Conflicting files:**"$'\n'"\`\`\`"$'\n'"$CONFLICTS"$'\n'"\`\`\`"$'\n\n'"Resolve conflicts locally or with an agent and merge this PR into \`local\`."
+
+            gh pr create \
+              --base local \
+              --head "$BRANCH" \
+              --title "🚨 Sync Upstream ($DATE): Merge Conflicts" \
+              --body "$PR_BODY"
+          fi
