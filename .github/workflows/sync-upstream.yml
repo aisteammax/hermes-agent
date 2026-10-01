@@ -43,14 +43,17 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           keep_our_workflows() {
-            if git diff --quiet "$1" HEAD -- .github/workflows; then
-              return 0
-            fi
+            base="$1"
+            touched=$(git diff --name-only "$base" HEAD -- .github/workflows | wc -l)
             git rm -rq --ignore-unmatch --cached .github/workflows
-            git checkout "$1" -- .github/workflows
+            git checkout "$base" -- .github/workflows
             git clean -fdq .github/workflows
-            git commit --amend --no-edit
-            echo "Kept our .github/workflows (upstream edits to it were dropped)."
+            if git diff --cached --quiet -- .github/workflows; then
+              echo ".github/workflows already ours ($touched upstream file(s) touched); nothing to amend."
+            else
+              git commit --amend --no-edit
+              echo "Kept our .github/workflows: $touched upstream file(s) reverted."
+            fi
           }
 
           echo "::group::mirror main"
@@ -80,10 +83,10 @@ jobs:
             DATE=$(date +%Y%m%d-%H%M)
             BRANCH="sync-upstream-$DATE"
             git checkout -b "$BRANCH" upstream/main
-            if ! git diff --quiet local HEAD -- .github/workflows; then
-              git rm -rq --ignore-unmatch --cached .github/workflows
-              git checkout local -- .github/workflows
-              git clean -fdq .github/workflows
+            git rm -rq --ignore-unmatch --cached .github/workflows
+            git checkout local -- .github/workflows
+            git clean -fdq .github/workflows
+            if ! git diff --cached --quiet -- .github/workflows; then
               git commit -m "sync: carry our .github/workflows (upstream edits dropped)"
             fi
             git push origin "$BRANCH"
