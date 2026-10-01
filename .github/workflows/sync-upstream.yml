@@ -71,6 +71,7 @@ jobs:
 
           BASE=$(git rev-parse HEAD)
           if git merge --no-edit upstream/main; then
+            keep_our_workflows "$BASE"
             echo "Clean merge, pushing to local..."
             git push origin local
           else
