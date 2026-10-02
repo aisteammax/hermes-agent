@@ -1,0 +1,102 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # 21:00 UTC = 04:00 AM ICT (UTC+7)
+    - cron: '0 21 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout local branch
+        uses: actions/checkout@v4
+        with:
+          ref: local
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add and fetch upstream
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main
+          git fetch origin main
+
+      # GITHUB_TOKEN has no `workflows` permission — that scope does not exist for it — so a
+      # single upstream edit under .github/workflows/ rejects the whole push (that is what
+      # broke the nightly sync). We merge upstream as usual, then put our own
+      # .github/workflows/ back on top and amend: the robot never writes files it is not
+      # allowed to write, and every other upstream change still lands.
+      - name: Merge upstream into local
+        id: merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          keep_our_workflows() {
+            base="$1"
+            touched=$(git diff --name-only "$base" HEAD -- .github/workflows | wc -l)
+            git rm -rq --ignore-unmatch --cached .github/workflows
+            git checkout "$base" -- .github/workflows
+            git clean -fdq .github/workflows
+            if git diff --cached --quiet -- .github/workflows; then
+              echo ".github/workflows already ours ($touched upstream file(s) touched); nothing to amend."
+            else
+              git commit --amend --no-edit
+              echo "Kept our .github/workflows: $touched upstream file(s) reverted."
+            fi
+          }
+
+          echo "::group::mirror main"
+          git checkout -B main origin/main
+          MAIN_BASE=$(git rev-parse HEAD)
+          if git merge --no-edit upstream/main; then
+            keep_our_workflows "$MAIN_BASE"
+            git push origin main
+          else
+            echo "::warning::upstream/main does not merge into main cleanly; main left alone"
+            git merge --abort
+          fi
+          git checkout local
+          echo "::endgroup::"
+
+          BASE=$(git rev-parse HEAD)
+          if git merge --no-edit upstream/main; then
+            keep_our_workflows "$BASE"
+            echo "Clean merge, pushing to local..."
+            git push origin local
+          else
+            echo "Merge conflict detected!"
+            CONFLICTS=$(git diff --name-only --diff-filter=U)
+            echo "Conflicting files:"
+            echo "$CONFLICTS"
+            git merge --abort
+
+            DATE=$(date +%Y%m%d-%H%M)
+            BRANCH="sync-upstream-$DATE"
+            git checkout -b "$BRANCH" upstream/main
+            git rm -rq --ignore-unmatch --cached .github/workflows
+            git checkout local -- .github/workflows
+            git clean -fdq .github/workflows
+            if ! git diff --cached --quiet -- .github/workflows; then
+              git commit -m "sync: carry our .github/workflows (upstream edits dropped)"
+            fi
+            git push origin "$BRANCH"
+
+            PR_BODY="### 🚨 Auto-sync conflict detected"$'\n\n'"Upstream changes conflict with our local patches."$'\n\n'"**Conflicting files:**"$'\n'"\`\`\`"$'\n'"$CONFLICTS"$'\n'"\`\`\`"$'\n\n'"Resolve conflicts locally or with an agent and merge this PR into \`local\`."
+
+            gh pr create \
+              --base local \
+              --head "$BRANCH" \
+              --title "🚨 Sync Upstream ($DATE): Merge Conflicts" \
+              --body "$PR_BODY"
+          fi
