@@ -1851,14 +1851,6 @@ def restart() -> None:
     from hermes_cli.gateway import _wait_for_api_server_port_free  # avoid circular init
 
     _wait_for_api_server_port_free()
-
-    # Write the restart-pending marker so the new gateway sends the
-    # home-channel back-online notification (♻️ Gateway online…).
-    try:
-        from hermes_cli.config import get_hermes_home
-        (Path(get_hermes_home()) / ".restart_pending.json").write_text("{}", encoding="utf-8")
-    except Exception:
-        pass
     start()
 
     if not _wait_for_gateway_ready(timeout_s=15.0):
