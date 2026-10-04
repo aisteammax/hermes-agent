@@ -11,7 +11,6 @@ from agent.codex_responses_adapter import (
     _neutralize_harmony_tokens,
     _preflight_codex_api_kwargs,
     _preflight_codex_input_items,
-    model_accepts_video_input,
 )
 
 
@@ -171,62 +170,6 @@ def test_chat_content_rejects_video_instead_of_sending_text_only(part_type):
         _chat_messages_to_responses_input([{"role": "user", "content": content}])
 
 
-_VIDEO_DATA_URL = "data:video/mp4;base64,AAAA"
-
-
-@pytest.mark.parametrize("part_type", ["video_url", "video", "input_video"])
-def test_video_parts_convert_for_video_capable_models(part_type):
-    """muse-spark accepts ``input_video`` on /responses (verified live against the endpoint), so the
-    fail-closed gate opens for it and must emit the exact wire shape that endpoint takes."""
-    content = [
-        {"type": part_type, part_type: {"url": _VIDEO_DATA_URL}},
-        {"type": "text", "text": "Describe the video"},
-    ]
-    items = _chat_messages_to_responses_input(
-        [{"role": "user", "content": content}], video_capable=True,
-    )
-    assert items[0]["content"] == [
-        {"type": "input_video", "video_url": _VIDEO_DATA_URL},
-        {"type": "input_text", "text": "Describe the video"},
-    ]
-
-
-def test_video_url_may_be_a_plain_string_for_video_capable_models():
-    items = _chat_messages_to_responses_input(
-        [{"role": "user", "content": [{"type": "video_url", "video_url": _VIDEO_DATA_URL}]}],
-        video_capable=True,
-    )
-    assert items[0]["content"] == [{"type": "input_video", "video_url": _VIDEO_DATA_URL}]
-
-
-def test_assistant_video_becomes_text_placeholder_not_input_video():
-    """An assistant media part 400s every replay, so assistant videos downgrade like assistant images."""
-    items = _chat_messages_to_responses_input(
-        [{"role": "assistant", "content": [{"type": "video_url", "video_url": {"url": _VIDEO_DATA_URL}}]}],
-        video_capable=True,
-    )
-    assert items[0]["content"] == [
-        {"type": "output_text", "text": "[Assistant video omitted during replay]"},
-    ]
-
-
-def test_empty_video_url_is_dropped_not_sent():
-    items = _chat_messages_to_responses_input(
-        [{"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "video_url", "video_url": {}}]}],
-        video_capable=True,
-    )
-    assert items[0]["content"] == [{"type": "input_text", "text": "hi"}]
-
-
-def test_video_gate_is_model_gated_by_default():
-    """Only known video-capable families may convert; everything else keeps failing closed."""
-    assert model_accepts_video_input("muse-spark-1.3-contributor") is True
-    assert model_accepts_video_input("opencode-go/muse-spark-1.3-contributor") is True
-    assert model_accepts_video_input("gpt-5.5") is False
-    assert model_accepts_video_input("deepseek-v4.1-flash") is False
-    assert model_accepts_video_input(None) is False
-
-
 def test_preflight_rewrites_raw_assistant_images_to_text_markers():
     raw = [{
         "role": "assistant",
@@ -237,6 +180,7 @@ def test_preflight_rewrites_raw_assistant_images_to_text_markers():
     }]
 
     assert _preflight_codex_input_items(raw) == [{
+        "type": "message",
         "role": "assistant",
         "content": [{
             "type": "output_text",
@@ -1051,3 +995,55 @@ def test_codex_preflight_passes_text_verbosity_through():
     assert _preflight_codex_api_kwargs(dict(kwargs))["text"] == {"verbosity": "low"}
     # An empty block is dropped, like the other optional fields, instead of rejected.
     assert "text" not in _preflight_codex_api_kwargs({**kwargs, "text": {}})
+
+
+@pytest.mark.parametrize("issuer", [None, "codex_backend"])
+def test_converter_role_items_are_typed_and_survive_preflight(issuer):
+    """llama.cpp's /v1/responses rejects typeless message items; preflight must accept every
+    item the converter emits, including user image parts."""
+    items = _chat_messages_to_responses_input([
+        {"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]},
+        {"role": "assistant", "content": "a cat"},
+        {"role": "assistant", "content": "", "codex_reasoning_items": [
+            {"type": "reasoning", "encrypted_content": "opaque", "summary": []},
+        ]},
+        {"role": "user", "content": "thanks"},
+    ], current_issuer_kind=issuer)
+
+    normalized = _preflight_codex_input_items(items)
+
+    role_items = [i for i in normalized if i.get("role")]
+    assert role_items and all(i["type"] == "message" for i in role_items)
+    assert {"type": "input_image", "image_url": "data:image/png;base64,AAAA"} in role_items[0]["content"]
+    assert normalized == items
+
+
+@pytest.mark.parametrize("issuer", [None, "codex_backend"])
+@pytest.mark.parametrize("structured", [False, True])
+def test_role_message_phase_survives_conversion_and_preflight(issuer, structured):
+    """Assistant phase is resent through conversion and preflight, per OpenAI's replay guidance."""
+    content = [{"type": "text", "text": "Checking."}] if structured else "Checking."
+    history = [
+        {"role": "user", "content": "audit"},
+        {"role": "assistant", "content": content, "phase": " Commentary "},
+    ]
+    converted = _chat_messages_to_responses_input(history, current_issuer_kind=issuer)
+
+    normalized = _preflight_codex_api_kwargs({"model": "m", "instructions": "i", "input": converted, "store": False})
+
+    assert converted[-1]["phase"] == "commentary"
+    assert normalized["input"] == converted
+
+
+def test_role_message_phase_is_kept_only_for_assistant_values_the_api_accepts():
+    wire = _preflight_codex_input_items([
+        {"role": "assistant", "content": "a", "phase": "final_answer"},
+        {"role": "assistant", "content": "b", "phase": "analysis"},
+        {"role": "assistant", "content": "c", "phase": 42},
+        {"role": "user", "content": "d", "phase": "commentary"},
+    ])
+
+    assert [item.get("phase") for item in wire] == ["final_answer", None, None, None]

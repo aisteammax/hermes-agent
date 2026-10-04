@@ -93,18 +93,6 @@ _IMAGE_PART_TYPES = {"image_url", "input_image"}
 _VIDEO_PART_TYPES = {"video", "video_url", "input_video"}
 _OUTPUT_TEXT_TYPES = {"output_text", "text"}
 _ASSISTANT_IMAGE_PLACEHOLDER = "[Assistant image omitted during replay]"
-_ASSISTANT_VIDEO_PLACEHOLDER = "[Assistant video omitted during replay]"
-# Responses backends that accept ``input_video`` parts. Verified live against the endpoint: a 2 s
-# animated clip came back described by its motion, not as a single frame. Families not listed here
-# keep the fail-closed contract, because a video request that silently degrades to text-only is
-# worse than a clear error — the model then answers about nothing and looks authoritative.
-_VIDEO_CAPABLE_MODEL_MARKERS = ("muse-spark",)
-
-
-def model_accepts_video_input(model: Optional[str]) -> bool:
-    """True when ``model`` is known to accept ``input_video`` parts on a Responses backend."""
-    name = (model or "").strip().lower()
-    return any(marker in name for marker in _VIDEO_CAPABLE_MODEL_MARKERS)
 # Inline data-URL subtypes the Responses backends accept as ``input_image``. Anything else
 # (SVG source, BMP, TIFF, ...) 400s the WHOLE request — and, once baked into history, every
 # later turn too — so it is downgraded to a text placeholder at this converging seam (#29711).
@@ -215,7 +203,7 @@ def _neutralize_harmony_structure(value: Any) -> Any:
 # --- Multimodal content helpers ---------------------------------------------
 
 def _iter_content_parts(content: list) -> Iterator[tuple[str, Any]]:
-    """Yield ``("text", str)`` / ``("image", part)`` / ``("video", part)`` for recognized chat parts."""
+    """Yield ``("text", str)`` / ``("image", part)`` for recognized chat parts."""
     for part in content:
         if isinstance(part, str) and part:
             yield "text", part
@@ -225,8 +213,6 @@ def _iter_content_parts(content: list) -> Iterator[tuple[str, Any]]:
                 yield "text", part["text"]
             elif ptype in _IMAGE_PART_TYPES:
                 yield "image", part
-            elif ptype in _VIDEO_PART_TYPES:
-                yield "video", part
 
 
 def _input_image_part(part: Dict[str, Any], role: str = "user", *, keep_empty_url: bool) -> Optional[Dict[str, Any]]:
@@ -260,32 +246,13 @@ def _input_image_part(part: Dict[str, Any], role: str = "user", *, keep_empty_ur
     return image_part
 
 
-def _input_video_part(part: Dict[str, Any], role: str = "user") -> Optional[Dict[str, Any]]:
-    """Responses video part from a chat/Responses video part. Assistant → text placeholder (an
-    assistant media part 400s the replay, same as images); user → ``input_video``, None for an
-    empty url. ``video_url`` may be a str, a ``{url, file_id}`` mapping, or the chat ``video`` key."""
-    if role == "assistant":
-        return {"type": "output_text", "text": _ASSISTANT_VIDEO_PLACEHOLDER}
-    url = part.get("video_url")
-    if url is None:
-        url = part.get("input_video") or part.get("video")
-    if isinstance(url, dict):
-        url = url.get("url") or url.get("file_id")
-    if not _nonempty_str(url):
-        return None
-    return {"type": "input_video", "video_url": str(url)}
-
-
-def _chat_content_to_responses_parts(content: Any, *, role: str = "user",
-                                     video_capable: bool = False) -> List[Dict[str, Any]]:
+def _chat_content_to_responses_parts(content: Any, *, role: str = "user") -> List[Dict[str, Any]]:
     """Chat-style multimodal content → Responses API input parts ([] if not a list). Text is
     ``input_text`` (user) / ``output_text`` (assistant) — the API rejects the wrong type per role;
-    ``input_image`` is only legal on user messages (see :func:`_input_image_part`). Video converts
-    to ``input_video`` only for ``video_capable`` models; otherwise it still fails closed instead
-    of silently turning a video request into a text-only request."""
+    ``input_image`` is only legal on user messages (see :func:`_input_image_part`). Unsupported
+    video parts fail closed instead of silently turning a video request into a text-only request."""
     for part in _as_list(content):
-        if (isinstance(part, dict) and not video_capable
-                and (ptype := _part_type(part)) in _VIDEO_PART_TYPES):
+        if isinstance(part, dict) and (ptype := _part_type(part)) in _VIDEO_PART_TYPES:
             raise ValueError(
                 f"Codex Responses does not support {ptype} input; use a video-capable provider."
             )
@@ -294,9 +261,6 @@ def _chat_content_to_responses_parts(content: Any, *, role: str = "user",
     for kind, payload in _iter_content_parts(_as_list(content)):
         if kind == "text":
             converted.append({"type": text_type, "text": payload})
-        elif kind == "video":
-            if (video_part := _input_video_part(payload, role)) is not None:
-                converted.append(video_part)
         elif (part := _input_image_part(payload, role, keep_empty_url=False)) is not None:
             converted.append(part)
     return converted
@@ -312,14 +276,8 @@ def _summarize_user_message_for_log(content: Any, *, sep: str = " ") -> str:
             return ""
     parts = list(_iter_content_parts(content))
     text_bits = [payload for kind, payload in parts if kind == "text"]
-    image_count = sum(1 for kind, _ in parts if kind == "image")
-    video_count = sum(1 for kind, _ in parts if kind == "video")
-    markers = []
-    if image_count:
-        markers.append(f"{image_count} image{'s' if image_count != 1 else ''}")
-    if video_count:
-        markers.append(f"{video_count} video{'s' if video_count != 1 else ''}")
-    note = f"[{', '.join(markers)}]" if markers else ""
+    image_count = len(parts) - len(text_bits)
+    note = f"[{image_count} image{'s' if image_count != 1 else ''}]" if image_count else ""
     return " ".join(bit for bit in (note, sep.join(text_bits).strip()) if bit)
 
 
@@ -412,6 +370,19 @@ def _message_item(
     """Assistant ``message`` item; ``id``/``phase`` are added only when non-empty."""
     item: Dict[str, Any] = {"type": "message", "role": "assistant", "status": status, "content": content}
     item.update({k: v for k, v in (("id", item_id), ("phase", phase)) if v})
+    return item
+
+
+_ROLE_MESSAGE_PHASES = frozenset({"commentary", "final_answer"})
+
+
+def _role_message_item(role: str, content: Any, phase: Any = None) -> Dict[str, Any]:
+    """Plain ``message`` input item for ``role``. ``type`` is required: llama.cpp's ``/v1/responses``
+    parser rejects a typeless assistant item ("Cannot determine type of 'item'"). Assistant ``phase``
+    is forwarded only for values the API accepts on input messages; others would 400."""
+    item = {"type": "message", "role": role, "content": content}
+    if role == "assistant" and (cleaned := _lower_or_none(phase)) in _ROLE_MESSAGE_PHASES:
+        item["phase"] = cleaned
     return item
 
 
@@ -582,13 +553,12 @@ def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]], *, is_xai_responses: bool = False, is_github_responses: bool = False,
     replay_encrypted_reasoning: bool = True, current_issuer_kind: Optional[str] = None,
     current_issuer_model: Optional[str] = None, native_compaction_eligible: bool = False,
-    video_capable: bool = False,
 ) -> List[Dict[str, Any]]:
     """Convert internal chat-style messages to Responses input items.
 
     ``is_xai_responses``: signature compatibility only (xAI DOES replay encrypted reasoning).
     ``replay_encrypted_reasoning``: per-session kill switch, threaded False by
-    ``AIAgent._disable_codex_reasoning_replay`` after an ``invalid_encrypted_content`` 400.
+    ``AIAgent._disable_codex_reasoning_replay`` after a repeat ``invalid_encrypted_content`` 400.
     ``is_github_responses``: drops ``id`` from replayed message items (Copilot 401s on stale ids).
     ``current_issuer_kind`` / ``current_issuer_model``: provenance guard; items stamped by another issuer or
     model drop. Legacy items carrying only an endpoint stamp replay on a matching issuer.
@@ -648,9 +618,7 @@ def _chat_messages_to_responses_input(
         if role not in {"user", "assistant"}:
             continue
         content = msg.get("content", "")
-        content_parts = _chat_content_to_responses_parts(
-            content, role=role, video_capable=video_capable,
-        )  # [] unless a list
+        content_parts = _chat_content_to_responses_parts(content, role=role)  # [] unless a list
         text_type = _text_type_for(role)
         content_text = (
             "".join(p["text"] for p in content_parts if p["type"] == text_type)
@@ -659,7 +627,7 @@ def _chat_messages_to_responses_input(
         def wire_content(value: Any) -> Any:
             return [{"type": text_type, "text": value}] if typed_text_only and isinstance(value, str) else value
         if role == "user":
-            emit([{"role": role, "content": wire_content(content_parts or content_text)}], msg)
+            emit([_role_message_item(role, wire_content(content_parts or content_text))], msg)
             continue
         reasoning_items = [] if not replay_encrypted_reasoning else _replay_reasoning_items(
             msg, seen_item_ids=seen_item_ids, current_issuer_kind=current_issuer_kind,
@@ -680,7 +648,7 @@ def _chat_messages_to_responses_input(
         # non-empty: strict Responses-compatible providers reject "" with 400.
         if fallback is not None and not (fallback == "" and tool_items):
             follower = " " if fallback == "" else fallback
-            emit([{"role": "assistant", "content": wire_content(follower)}], msg)
+            emit([_role_message_item("assistant", wire_content(follower), msg.get("phase"))], msg)
         emit(tool_items, msg)
     # The server renders nothing placed before a compaction item, so pre-checkpoint history is
     # dead weight and plaintext asks / merged summaries silently vanish. Keep the newest checkpoint
@@ -752,7 +720,6 @@ def _native_responses_replay_items(
             current_issuer_kind=_classify_responses_issuer(base_url=getattr(agent, "base_url", None), **route),
             current_issuer_model=_wire_model_identity(effective_model),
             native_compaction_eligible=True,
-            video_capable=model_accepts_video_input(_wire_model_identity(effective_model)),
         )
     except Exception:
         logger.debug(
@@ -851,11 +818,16 @@ def _preflight_encrypted(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) -> 
 
 
 def _preflight_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) -> Dict[str, Any]:
-    if item.get("role") != "assistant":
-        raise ValueError(f"Codex Responses input[{idx}] message items must have role='assistant'.")
+    # Only replayed assistant output (a list-content item carrying id/status) takes the strict path
+    # below. Phase alone is no replay marker: the converter's plain role items carry it too, and
+    # preflight must not synthesize a status or reject user image parts for them.
     content = item.get("content")
-    if not isinstance(content, list):
-        raise ValueError(f"Codex Responses input[{idx}] message item must have content list.")
+    is_replayed_assistant = (
+        item.get("role") == "assistant" and isinstance(content, list)
+        and any(key in item for key in ("id", "status"))
+    )
+    if not is_replayed_assistant:
+        return _preflight_role_message(item, idx, ctx)
     normalized_content = []
     for part_idx, part in enumerate(content):
         if not isinstance(part, dict):
@@ -872,7 +844,7 @@ def _preflight_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) -> Di
 
 
 def _preflight_role_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) -> Dict[str, Any]:
-    """Untyped ``user``/``assistant`` role message — the only legal shape besides typed items."""
+    """``user``/``assistant`` role message, typed or untyped; string content or Responses parts."""
     role = item.get("role")
     if role not in {"user", "assistant"}:
         raise ValueError(
@@ -880,7 +852,7 @@ def _preflight_role_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) 
         )
     content = item.get("content", "")
     if not isinstance(content, list):
-        return {"role": role, "content": ctx.sanitize_text(_str_or_empty(content))}
+        return _role_message_item(role, ctx.sanitize_text(_str_or_empty(content)), item.get("phase"))
     # Parts are already Responses-shaped; validate and re-type text for the role.
     # Unlike history conversion, empty text / empty image urls are kept, not dropped.
     text_type = _text_type_for(role)
@@ -901,7 +873,7 @@ def _preflight_role_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) 
             raise ValueError(
                 f"Codex Responses input[{idx}].content[{part_idx}] has unsupported type {part.get('type')!r}."
             )
-    return {"role": role, "content": validated}
+    return _role_message_item(role, validated, item.get("phase"))
 
 
 _PREFLIGHT_ITEM_HANDLERS: Dict[str, Callable[..., Optional[Dict[str, Any]]]] = {
