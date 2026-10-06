@@ -10,6 +10,7 @@ are read lazily from ``tools.transcription_tools``.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import tempfile
 from pathlib import Path
@@ -17,11 +18,12 @@ from typing import Any, Callable, Dict, Optional
 from urllib.parse import urljoin
 
 from utils import is_truthy_value
-from tools.transcription_audio import _transcode_audio_for_stt
+from tools.transcription_audio import _find_ffmpeg_binary, _run_quiet, _transcode_audio_for_stt
 from tools.transcription_common import (
-    DEFAULT_GROQ_STT_MODEL, DEFAULT_STT_MODEL, ELEVENLABS_STT_BASE_URL, GROQ_BASE_URL, GROQ_MODELS,
-    OPENAI_BASE_URL, OPENAI_MODELS, STTResponseError, XAI_STT_BASE_URL, _error_result, _get_stt_section,
-    _lazy_ensure_quietly, _log_prompt_unsupported, _ok_result)
+    DEFAULT_GROQ_STT_MODEL, DEFAULT_RESPONSES_STT_MODEL, DEFAULT_STT_MODEL, DEFAULT_STT_TIMEOUT,
+    ELEVENLABS_STT_BASE_URL, GROQ_BASE_URL, GROQ_MODELS, OPENAI_BASE_URL, OPENAI_MODELS,
+    RESPONSES_STT_BASE_URL, STTResponseError, XAI_STT_BASE_URL, _config_number, _error_result,
+    _get_stt_section, _lazy_ensure_quietly, _log_prompt_unsupported, _ok_result)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("tools.transcription_tools")
@@ -467,3 +469,94 @@ def _extract_transcript_text(transcription: Any) -> str:
             text = str(transcription).strip()
     match = _ASR_TEXT_RE.match(text)
     return match.group("text").strip() if match else text
+
+
+def _transcribe_responses(
+    file_path: str, model_name: str, *, language: Optional[str] = None, prompt: Optional[str] = None
+) -> Dict[str, Any]:
+    """Transcribe using a generic Responses API endpoint (/responses) with input_audio."""
+    import base64
+    import requests
+    from tools.transcription_tools import _load_stt_config, _resolve_provider_key
+
+    stt_config = _load_stt_config()
+    cfg = _get_stt_section(stt_config, "responses") or _get_stt_section(stt_config, "muse")
+    base_url = str(
+        cfg.get("base_url") or RESPONSES_STT_BASE_URL
+    ).strip().rstrip("/")
+    api_key = (
+        cfg.get("api_key")
+        or _resolve_provider_key("RESPONSES_STT_API_KEY", "responses")
+        or _resolve_provider_key("OPENCODE_GO_API_KEY", "opencode-go")
+        or _resolve_provider_key("OPENCODE_API_KEY", "opencode")
+    )
+    if not api_key:
+        return _error_result(
+            "No API key configured for STT provider 'responses'. Set stt.responses.api_key or OPENCODE_GO_API_KEY."
+        )
+
+    ffmpeg = _find_ffmpeg_binary()
+    if not ffmpeg:
+        return _error_result("ffmpeg is required for responses STT audio conversion")
+
+    # Transcode audio to 16kHz mono WAV for input_audio
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_wav = tmp.name
+    try:
+        _run_quiet([ffmpeg, "-y", "-i", file_path, "-vn", "-ac", "1", "-ar", "16000", tmp_wav], timeout=120)
+        with open(tmp_wav, "rb") as f:
+            b64_audio = base64.b64encode(f.read()).decode("utf-8")
+    except Exception as exc:
+        return _error_result(f"Audio conversion failed: {exc}")
+    finally:
+        if os.path.exists(tmp_wav):
+            try:
+                os.remove(tmp_wav)
+            except OSError:
+                pass
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": "curl/8.7.1",
+    }
+    if "opencode" in base_url.lower():
+        headers["x-opencode-session"] = "hermes-stt"
+
+    instruction = prompt or "Transcribe the spoken audio verbatim in its original language. Output only the verbatim transcription without commentary or apology."
+    if language:
+        instruction += f" Spoken language hint: {language}."
+
+    timeout = _config_number(cfg, "timeout", DEFAULT_STT_TIMEOUT)
+    model = model_name or cfg.get("model") or DEFAULT_RESPONSES_STT_MODEL
+    payload = {
+        "model": model,
+        "reasoning": {"effort": cfg.get("reasoning_effort", "minimal")},
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_audio", "input_audio": {"data": b64_audio, "format": "wav"}},
+                {"type": "input_text", "text": instruction}
+            ]
+        }]
+    }
+
+    url = f"{base_url}/responses"
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        if resp.status_code != 200:
+            return _error_result(f"Responses STT API error (HTTP {resp.status_code}): {resp.text[:300]}")
+        data = resp.json()
+        transcript = ""
+        for item in data.get("output", []):
+            for c in item.get("content", []):
+                if c.get("type") in ("output_text", "text") or "text" in c:
+                    transcript += c.get("text", "")
+        transcript = transcript.strip()
+        if not transcript:
+            return _error_result("Responses STT returned empty transcript", no_speech=True)
+        logger.info("Transcribed %s via Responses STT (%s, %d chars)", Path(file_path).name, model, len(transcript))
+        return _ok_result(transcript, "responses")
+    except Exception as exc:
+        return _error_result(f"Responses STT request failed: {exc}")
+
