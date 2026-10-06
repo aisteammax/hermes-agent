@@ -11,6 +11,7 @@ from agent.codex_responses_adapter import (
     _neutralize_harmony_tokens,
     _preflight_codex_api_kwargs,
     _preflight_codex_input_items,
+    model_accepts_video_input,
 )
 
 
@@ -168,6 +169,62 @@ def test_chat_content_rejects_video_instead_of_sending_text_only(part_type):
     ]
     with pytest.raises(ValueError, match=f"does not support {part_type} input"):
         _chat_messages_to_responses_input([{"role": "user", "content": content}])
+
+
+_VIDEO_DATA_URL = "data:video/mp4;base64,AAAA"
+
+
+@pytest.mark.parametrize("part_type", ["video_url", "video", "input_video"])
+def test_video_parts_convert_for_video_capable_models(part_type):
+    """muse-spark accepts ``input_video`` on /responses (verified live against the endpoint), so the
+    fail-closed gate opens for it and must emit the exact wire shape that endpoint takes."""
+    content = [
+        {"type": part_type, part_type: {"url": _VIDEO_DATA_URL}},
+        {"type": "text", "text": "Describe the video"},
+    ]
+    items = _chat_messages_to_responses_input(
+        [{"role": "user", "content": content}], video_capable=True,
+    )
+    assert items[0]["content"] == [
+        {"type": "input_video", "video_url": _VIDEO_DATA_URL},
+        {"type": "input_text", "text": "Describe the video"},
+    ]
+
+
+def test_video_url_may_be_a_plain_string_for_video_capable_models():
+    items = _chat_messages_to_responses_input(
+        [{"role": "user", "content": [{"type": "video_url", "video_url": _VIDEO_DATA_URL}]}],
+        video_capable=True,
+    )
+    assert items[0]["content"] == [{"type": "input_video", "video_url": _VIDEO_DATA_URL}]
+
+
+def test_assistant_video_becomes_text_placeholder_not_input_video():
+    """An assistant media part 400s every replay, so assistant videos downgrade like assistant images."""
+    items = _chat_messages_to_responses_input(
+        [{"role": "assistant", "content": [{"type": "video_url", "video_url": {"url": _VIDEO_DATA_URL}}]}],
+        video_capable=True,
+    )
+    assert items[0]["content"] == [
+        {"type": "output_text", "text": "[Assistant video omitted during replay]"},
+    ]
+
+
+def test_empty_video_url_is_dropped_not_sent():
+    items = _chat_messages_to_responses_input(
+        [{"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "video_url", "video_url": {}}]}],
+        video_capable=True,
+    )
+    assert items[0]["content"] == [{"type": "input_text", "text": "hi"}]
+
+
+def test_video_gate_is_model_gated_by_default():
+    """Only known video-capable families may convert; everything else keeps failing closed."""
+    assert model_accepts_video_input("muse-spark-1.3-contributor") is True
+    assert model_accepts_video_input("opencode-go/muse-spark-1.3-contributor") is True
+    assert model_accepts_video_input("gpt-5.5") is False
+    assert model_accepts_video_input("deepseek-v4.1-flash") is False
+    assert model_accepts_video_input(None) is False
 
 
 def test_preflight_rewrites_raw_assistant_images_to_text_markers():

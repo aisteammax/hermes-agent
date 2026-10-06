@@ -1412,6 +1412,7 @@ class _CodexCompletionsAdapter:
             _role_message_item,
             _wire_model_identity,
             classify_responses_route,
+            model_accepts_video_input,
         )
         from agent.transports.codex import _alias_wire_tools
         model = kwargs.get("model", self._model)
@@ -1479,6 +1480,7 @@ class _CodexCompletionsAdapter:
             replay_messages, is_github_responses=is_copilot,
             current_issuer_kind=issuer_kind,
             current_issuer_model=wire_model, native_compaction_eligible=False,
+            video_capable=model_accepts_video_input(wire_model),
         )
         resp_kwargs: dict[str, Any] = {
             # Codex only knows the base slug; strip the Hermes ``-900k`` picker suffix.
